@@ -1,0 +1,147 @@
+Single Cell Downstream Analysis
+
+Импортируем нужные библиотеки
+
+```{r}
+library(Seurat)
+library(ggplot2)
+library(dplyr)
+```
+
+Загрузим файл с нейронами, в котором судя по файлу metadata_FACS.csv точно более 2 подгрупп клеток.
+
+```{r}
+Brain_Neurons <- read.csv("C:\\Users\\asus\\Documents\\FACS\\FACS\\Brain_Neurons-counts.csv")
+head(Brain_Neurons)
+```
+
+Уберем пропуски и создадим seurat-объект
+
+```{r}
+Brain_Neurons_clean <- na.omit(Brain_Neurons)
+seurat_BN <- CreateSeuratObject(counts = Brain_Neurons_clean, project = "BN")
+```
+
+Попробуем посчитать процентное содержание митоходриальных генов
+
+```{r}
+seurat_BN[["percent.mt"]] <- PercentageFeatureSet(seurat_BN, pattern = "(?i)^Mt")
+```
+
+Судя по всему, конкретно эта часть кода не работает, причем я не понимаю почему. Я игнорирую регистр, посмотрел наличие митохондриальных генов в данных, а процент все равно всюду 0, это можно увидеть вдальнейшем на графике:
+
+```{r}
+VlnPlot(seurat_BN_filtered, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+```
+
+Проведем отчистку от выбросов и заодно посмотрим, какая часть данных удалена
+
+```{r}
+seurat_BN_filtered <- subset(seurat_BN, subset = nFeature_RNA > 200 & nFeature_RNA < 2500 & percent.mt < 5)
+cat("Было:", ncol(seurat_BN), "клеток\n")
+cat("Стало:", ncol(seurat_BN_filtered), "клеток\n")
+cat("Отфильтровано:", ncol(seurat_BN) - ncol(seurat_BN_filtered), "клеток\n")
+```
+
+Половина данных была удалена - возможно, данные правда оказались очень грязными, либо же стоит поэкспериментировать с параметром nFeature_RNA. Нормализуем данные
+
+```{r}
+seurat_BN_normalized <- NormalizeData(seurat_BN_filtered)
+```
+
+Проведем кластеризацию, затем визуализируем полученное разбиение
+
+```{r}
+seurat_BN_normalized <- FindVariableFeatures(seurat_BN_normalized, selection.method = "vst")
+seurat_BN_normalized <- ScaleData(seurat_BN_normalized)
+seurat_BN_normalized <- RunPCA(seurat_BN_normalized, features = VariableFeatures(object = seurat_BN_normalized))
+seurat_BN_normalized <- FindNeighbors(seurat_BN_normalized, dims = 1:10)
+seurat_BN_normalized <- FindClusters(seurat_BN_normalized, resolution = 0.5)
+seurat_BN_umap <- RunUMAP(seurat_BN_normalized, dims = 1:10)
+```
+
+```{r}
+DimPlot(seurat_BN_umap, reduction = "umap", label=TRUE)
+```
+
+**Вывод:** за исключением кластеров 4 и 7, остальные клетки не так хорошо разделимы в целом. Тем не менее, разделение присутствует, что мы и ожидали увидеть. Визуализируем теперь гендерное разбиение
+
+```{r}
+seurat_BN_umap$gender <- ifelse(grepl("_M\\.", colnames(seurat_BN_umap)), "Male", "Female")
+table(seurat_BN_umap$gender)
+DimPlot(seurat_BN_umap, 
+        reduction = "umap", 
+        group.by = "gender",
+        cols = c("Male" = "blue", "Female" = "red")) +
+  ggtitle("UMAP by Gender")
+```
+
+**Вывод:** в целом в каждом "кластере" можно увидеть места, в которых предпочтительно сосредоточены клетки каждого гендера. Особеено виден установленный кластер 8, который почти полностью состоит из мужских клеток. Попробуем более точно изобразить соотношение клеток каждого гендера в каждом выделенном кластере:
+
+```{r}
+gender_cluster_table <- table(seurat_BN_umap$seurat_clusters, 
+                             seurat_BN_umap$gender)
+cluster_gender_df <- as.data.frame(gender_cluster_table)
+colnames(cluster_gender_df) <- c("Cluster", "Gender", "Count")
+cluster_gender_df <- cluster_gender_df %>%
+  group_by(Cluster) %>%
+  mutate(Percentage = Count / sum(Count) * 100) %>%
+  ungroup()
+```
+
+C тем, чтобы график ниже был более красивым и читабельным, помог Deepseek.
+
+```{r}
+ggplot(cluster_gender_df, aes(x = Cluster, y = Percentage, fill = Gender)) +
+  geom_bar(stat = "identity") +
+  geom_text(aes(label = paste0(round(Percentage, 1), "%")), 
+            position = position_stack(vjust = 0.5),
+            color = "black") +
+  scale_fill_manual(values = c("Male" = "blue", "Female" = "red")) +
+  labs(title = "Gender Distribution in Clusters",
+       x = "Cluster", 
+       y = "Percentage (%)") +
+  theme_minimal()
+```
+
+**Вывод:** как было видно по верхнему графику, кластер 8 действительно предпочтительно состоит из мужских клеток, также выделяется кластер 2, в котором мужских клеток в 3 раза больше женских. В обратную сторону имеются кластеры 0, 1 и 9, количество женских клеток которых примерно в 2 раза больше мужских. Отойдем от гендерного разбиения и попробуем разделить два кластера более детально - по экспрессируемым генам.
+
+```{r}
+cluster_counts <- table(seurat_BN_umap$seurat_clusters)
+print("Количество клеток в кластерах:")
+print(cluster_counts)
+```
+
+Выберем кластеры 2 и 4 как самые далекие, и при этом довольно богатые числом клеток
+
+```{r}
+cluster2 <- "2"
+cluster4 <- "4"
+seurat_subset <- subset(seurat_BN_umap, 
+                       subset = seurat_clusters %in% c(cluster2, cluster4))
+Idents(seurat_subset) <- "seurat_clusters"
+de_genes <- FindMarkers(seurat_subset,
+                       ident.1 = cluster2,
+                       ident.2 = cluster4,
+                       min.pct = 0.25,
+                       logfc.threshold = 0.25,
+                       only.pos = FALSE)
+
+top_genes <- rownames(head(de_genes, 10))
+print("Топ-10 дифференциально экспрессированных генов:")
+print(top_genes)
+```
+
+Визуализируем Heatmap:
+
+```{r}
+DoHeatmap(seurat_subset,
+          features = top_genes,
+          group.by = "seurat_clusters",
+          label = TRUE) +
+  ggtitle(paste("Top 10 DE Genes between", cluster2, "vs", cluster4))
+```
+
+**Вывод:** По heatmap можно видеть, что эти два кластера действительно практически полностью разделяются по этим генам. (Вторая неустраненная ошибка - непонятно, почему только эти 4 гена показаны, а остальные 6 - нет. При этом если попытаться визуализировать только один из непредставленных генов - выйдет ошибка что такого гена нет, хотя ранее мы как-то их нашли.)
+
+**Общий вывод по задаче:** задача довольно трудоемкая, особенно с учетом полного погружения в язык R. По началу было довольно сложно разобраться в том, что за что отвечает в данных, как вообще проводить Quality Control. С туториалом стало намного проще, а с учетом того, что графики строятся довольно схожим с питоном образом, дела пошли в гору. Самый интересный пункт - 4, но наверное я предвзят, потому что мне всегда нравится кластеризация - как будто какая-то магия происходит, когда модель смотрит на какие-то конкретные признаки и суммарно так хорошо разделяет данные (как с кластерами 4 и 7). Большая часть того, что я изучил в ходе решения этой задачи связана по большей части с языком R, основной интересный пункт из биологии - для клеток разных гендеров нужно разное количество генов (а иногда и разные гены в принципе). Удивительно, что речь идет о нейронах - клетках, казалось бы далеких от специализации в гендерном плане. Это может оказаться очень важным например при синтезе лекарств - в случае разных полов можно ожидать разный ответ на одни и те же вещества.
